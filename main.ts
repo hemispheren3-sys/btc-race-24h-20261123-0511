@@ -1,128 +1,146 @@
-// BTC race bot: slow-trend hold with wide hysteresis + trailing stop.
+// btc-race-24h-20261123-0511 — V2: slow dual-EMA trend rider.
 //
-// One symbol (CBBTC), long only, all-in. Two exponential moving averages of
-// the bar closes (fast span 30, slow span 120) decide the trend: enter when
-// the close sits above both averages, exit when it breaks decisively below
-// the slow average (1% under) or when equity has fallen 5% from its running
-// peak. The wide hysteresis keeps the bot in through ordinary chop; the
-// trailing peak stop caps the loss on a sharp turn. Warm-up is 120 closes,
-// so the slow average is fully formed before any order is sent.
+// Idea: ride the slow trend only. A fast EMA(40) over bar closes tracks the
+// near-term drift, a slow EMA(150) tracks the day's trend. We stay flat until
+// the slow average is fully formed (150 closes), then go all-in when price
+// sits above BOTH averages, and cut the whole position the moment price slips
+// 1% under the slow average or equity falls 5% from its running peak.
 //
-// Deterministic: the only inputs are the bars the harness sends. No clock,
-// no environment, no randomness — two runs on the same window produce
-// byte-identical action logs. Diagnostics go to stderr; stdout carries
-// replies only, as the protocol requires.
+// Everything is deterministic: the only inputs are the bar closes and the
+// account the harness sends. No clock, no environment, no randomness —
+// replaying the same window reproduces the same action log byte for byte.
+//
+// V2 vs V1: slower spans (40/150 instead of 30/120), so the entry fires later
+// (backtest: decision seq 156, fill bar 157) and only on a confirmed trend.
 
-import { runBars, type Bar, type BarsState, type BuyInput, type OrderInput, type SellInput } from './vendor/makefun-bars.ts';
+import { runBars } from './vendor/makefun-bars.ts';
+import type { BarsState, Batch, OrderInput } from './vendor/makefun-bars.ts';
 
 const SYMBOL = 'CBBTC';
-/** Spans of the two trend averages, in bars. */
-const FAST_SPAN = 30;
-const SLOW_SPAN = 120;
-/** No trading until this many closes have been seen (the slow average's span). */
-const WARMUP_CLOSES = 120;
-/** Exit when the close falls this far below the slow average (1%). */
-const BREAKDOWN_FACTOR = 0.99;
-/** Exit when equity falls this far from its running peak (5%). */
-const STOP_NUM = 95n;
-const STOP_DEN = 100n;
-/** Smallest buy the harness accepts is its min notional; we also refuse to trade dust. */
-const MIN_CASH_USDC = 1_000_000n; // 1 USDC in quote units
-const MAX_SLIPPAGE_BPS = 100;
 
-/** Smoothing constants, 2 / (span + 1), computed once. */
+// EMA spans. Alpha follows the textbook definition: alpha = 2 / (span + 1).
+const FAST_SPAN = 40;
+const SLOW_SPAN = 150;
 const FAST_ALPHA = 2 / (FAST_SPAN + 1);
 const SLOW_ALPHA = 2 / (SLOW_SPAN + 1);
 
-/** The trend state: both averages, seeded with the first close seen. */
-let fastEma: number | null = null;
-let slowEma: number | null = null;
-/** Closes folded in so far (counts only bars actually present in a batch). */
-let closesSeen = 0;
-/** Running peak equity, in quote units; seeded from the hello capital. */
-let peakEquity: bigint | null = null;
+// No trading until this many closes have been seen, so the slow EMA is real.
+const WARMUP_CLOSES = 150;
 
-/** Fold one fresh close into both averages. A bar the batch does not carry adds nothing. */
-function foldClose(close: number): void {
-  if (fastEma === null || slowEma === null) {
-    fastEma = close;
-    slowEma = close;
-  } else {
-    fastEma += (close - fastEma) * FAST_ALPHA;
-    slowEma += (close - slowEma) * SLOW_ALPHA;
+// Smallest buy the rules allow: 1 USDC = 1,000,000 quote units.
+const MIN_CASH = 1_000_000n;
+// Slippage budget on every order, in basis points.
+const MAX_SLIPPAGE_BPS = 100;
+// Exit band: sell when close < slow EMA * 99 / 100.
+const EXIT_BAND_NUM = 99;
+const EXIT_BAND_DEN = 100;
+// Peak-drawdown exit: sell when equity * 100 < peak * 95 (a 5% drawdown).
+const DRAWDOWN_NUM = 95n;
+const DRAWDOWN_DEN = 100n;
+
+/**
+ * The whole strategy state: two EMAs (null until the first close seeds them),
+ * how many closes have been folded in, and the trailing equity peak.
+ * EMAs are kept as plain numbers over the raw close units — the scale is the
+ * same on both sides of every comparison, so no rescaling is ever needed.
+ */
+class TrendState {
+  fastEma: number | null = null;
+  slowEma: number | null = null;
+  closesSeen = 0;
+  peakEquity: bigint | null = null;
+
+  /** Fold one fresh close in. Returns false when there was no bar to fold. */
+  observe(closeRaw: bigint): boolean {
+    const close = Number(closeRaw);
+    if (this.fastEma === null || this.slowEma === null) {
+      // Seed both averages at the very first close seen.
+      this.fastEma = close;
+      this.slowEma = close;
+    } else {
+      this.fastEma += FAST_ALPHA * (close - this.fastEma);
+      this.slowEma += SLOW_ALPHA * (close - this.slowEma);
+    }
+    this.closesSeen += 1;
+    return true;
   }
-  closesSeen += 1;
+
+  get warmedUp(): boolean {
+    return this.closesSeen >= WARMUP_CLOSES;
+  }
+
+  /** Track the equity peak upward; call on every batch, warm-up included. */
+  trailPeak(equity: bigint): void {
+    if (this.peakEquity === null || equity > this.peakEquity) {
+      this.peakEquity = equity;
+    }
+  }
+
+  get inUptrend(): boolean {
+    return this.fastEma !== null && this.slowEma !== null;
+  }
 }
 
-/** The close is above both trend averages: the uptrend the entry wants. */
-function aboveBoth(close: number): boolean {
-  return fastEma !== null && slowEma !== null && close > slowEma && close > fastEma;
-}
+const trend = new TrendState();
 
-/** The close has broken decisively below the slow average: 1% under it. */
-function brokenDown(close: number): boolean {
-  return slowEma !== null && close < slowEma * BREAKDOWN_FACTOR;
-}
+/**
+ * Decide the orders for one batch. At most one order ever leaves here:
+ * a full-cash buy when flat in an uptrend, or a full-position sell when long
+ * and an exit rule trips. Anything else returns no orders.
+ */
+function decide(state: BarsState, batch: Batch): OrderInput[] {
+  // A batch without our symbol is a gap: no EMA update, no decision.
+  const bar = batch.bars.find((b) => b.symbol === SYMBOL);
+  if (bar === undefined) return [];
 
-/** Equity has drawn down 5% or more from its running peak (bigint-exact). */
-function stoppedOut(equity: bigint): boolean {
-  return peakEquity !== null && equity * STOP_DEN < peakEquity * STOP_NUM;
-}
+  const closeRaw = BigInt(bar.c);
+  trend.observe(closeRaw);
 
-/** The whole-cash buy, capped by the weight room the caps allow. */
-function buyAllIn(state: BarsState): BuyInput | null {
-  const room = state.weightRoom(SYMBOL);
-  const spend = state.cash < room ? state.cash : room;
-  if (spend < MIN_CASH_USDC) return null;
-  return { side: 'buy', symbol: SYMBOL, notional_quote_units: spend, max_slippage_bps: MAX_SLIPPAGE_BPS };
-}
+  // The peak trails equity on every batch, warm-up included.
+  trend.trailPeak(state.equity);
 
-/** Sell the entire held quantity of the symbol. */
-function sellAll(state: BarsState): SellInput {
-  const held = state.positions.get(SYMBOL)!;
-  return { side: 'sell', symbol: SYMBOL, qty: held.qty, max_slippage_bps: MAX_SLIPPAGE_BPS };
+  // Warm-up batches reject every order, and the slow EMA is not formed yet:
+  // in both cases the only correct answer is silence.
+  if (state.warmingUp || !trend.warmedUp) return [];
+
+  const close = Number(closeRaw);
+  const fast = trend.fastEma as number;
+  const slow = trend.slowEma as number;
+  const held = state.positions.get(SYMBOL);
+  const holdingQty = held === undefined ? 0n : held.qty;
+
+  if (holdingQty > 0n) {
+    // Long: exit on a 1% break under the slow average, or on a 5% drawdown
+    // from the running equity peak (exact bigint comparison, no floats).
+    const underBand = close < (slow * EXIT_BAND_NUM) / EXIT_BAND_DEN;
+    const peak = trend.peakEquity as bigint;
+    const drawnDown = state.equity * DRAWDOWN_DEN < peak * DRAWDOWN_NUM;
+    if (underBand || drawnDown) {
+      return [{ side: 'sell', symbol: SYMBOL, qty: holdingQty, max_slippage_bps: MAX_SLIPPAGE_BPS }];
+    }
+    return [];
+  }
+
+  // Flat: go all-in only above both averages, and only with real cash.
+  if (state.cash < MIN_CASH) return [];
+  if (close > slow && close > fast) {
+    return [{ side: 'buy', symbol: SYMBOL, notional_quote_units: state.cash, max_slippage_bps: MAX_SLIPPAGE_BPS }];
+  }
+  return [];
 }
 
 await runBars({
   onHello(state) {
-    // The peak starts at the starting equity, so the first 5% slide from the
-    // open is already a stop-out, not a free fall.
-    peakEquity = state.equity;
+    // The peak starts at the initial equity and only ever moves up.
+    trend.trailPeak(state.equity);
   },
-
-  onBatch(state, batch): OrderInput[] {
-    // The peak trails equity upward, bar by bar, before any decision.
-    if (peakEquity === null) peakEquity = state.equity;
-    if (state.equity > peakEquity) peakEquity = state.equity;
-
-    // Fold in this batch's fresh closes. A symbol absent from the batch is a
-    // gap: no close, no update, no decision on it.
-    let freshClose: number | null = null;
-    for (const bar of batch.bars) {
-      if (bar.symbol !== SYMBOL) continue;
-      const close = Number(bar.c);
-      foldClose(close);
-      freshClose = close;
-    }
-    if (freshClose === null) return [];
-
-    // Warm-up batches are rejected by the replay, and the slow average is
-    // not formed until 120 closes: send nothing until both are past.
-    if (state.warmingUp || closesSeen < WARMUP_CLOSES) return [];
-
-    const held = state.positions.get(SYMBOL);
-    if (held !== undefined) {
-      // Long: leave only on a decisive breakdown below the slow average, or
-      // on a 5% drawdown from the running peak. Either reason sells it all.
-      if (brokenDown(freshClose) || stoppedOut(state.equity)) return [sellAll(state)];
-      return [];
-    }
-
-    // Flat: enter all-in when the close is above both trend averages.
-    if (aboveBoth(freshClose)) {
-      const buy = buyAllIn(state);
-      if (buy !== null) return [buy];
-    }
-    return [];
+  onBatch(state, batch) {
+    return decide(state, batch);
+  },
+  onDone(state) {
+    console.error(
+      `done seq=${state.seq} equity=${state.equity} cash=${state.cash} closes=${trend.closesSeen}`,
+    );
   },
 });
+
